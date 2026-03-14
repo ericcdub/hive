@@ -21,3 +21,4 @@ Thumbs.db
 
 # Local config
 .cargo/config.toml
+.claude/settings.json

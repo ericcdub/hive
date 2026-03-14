@@ -71,7 +71,7 @@
 use rust_hive::bookmarks::{Bookmark, BookmarkColor};
 use rust_hive::registry::{self, RegValue, RegistryValue, RootKey};
 use rust_hive::search::{MatchType, SearchOptions, SearchResult, SearchState};
-use rust_hive::sync::{PendingChange, SyncConflict, SyncStore};
+use rust_hive::sync::{DebugCategory, PendingChange, SyncConflict, SyncStore};
 
 // External crate imports
 use eframe::egui;
@@ -238,6 +238,10 @@ pub struct RegistryEditorApp {
     /// Snapshot of search results for stable display during search.
     /// Updated periodically during search to show progress.
     search_results_snapshot: Vec<SearchResult>,
+    
+    /// The last search query that was executed.
+    /// Used to avoid re-running the same search on Enter.
+    last_executed_query: String,
 
     // ─────────────────────────────────────────────────────────────────────
     // Backend - Database and sync
@@ -272,14 +276,23 @@ pub struct RegistryEditorApp {
     /// Whether search options panel is expanded
     show_search_options: bool,
     
-    /// Whether sync settings panel is expanded
-    show_sync_settings: bool,
-    
     /// Track if we were syncing last frame (to detect completion)
     was_syncing: bool,
 
+    /// Track if we had pending fetches last frame (to detect completion)
+    had_pending_fetches: bool,
+
+    /// Track if we were searching last frame (to detect completion)
+    was_searching_last_frame: bool,
+
     /// Whether the debug overlay window is open
     show_profiler: bool,
+
+    /// Whether the debug log window is open (non-modal)
+    show_debug_log: bool,
+
+    /// Filter for debug log categories (None = show all)
+    debug_log_filter: Option<DebugCategory>,
 
     // ── Debug / profiling stats ───────────────────────────────────────────────
     /// Wall-clock time of the last frame start (for frame-time measurement)
@@ -340,6 +353,7 @@ impl RegistryEditorApp {
             search_options: SearchOptions::default(),
             search_state: SearchState::new(),
             search_results_snapshot: Vec::new(),
+            last_executed_query: String::new(),
             
             // Backend
             store,
@@ -352,9 +366,12 @@ impl RegistryEditorApp {
             edit_dialog: EditDialog::None,
             error_message: None,
             show_search_options: false,
-            show_sync_settings: false,
             was_syncing: false,
+            had_pending_fetches: false,
+            was_searching_last_frame: false,
             show_profiler: false,
+            show_debug_log: false,
+            debug_log_filter: None,
             last_frame_start: None,
             last_frame_ms: 0.0,
             last_tree_render_us: 0,
@@ -398,14 +415,20 @@ impl RegistryEditorApp {
     ///
     /// * `full_path` - Full path like "HKEY_CURRENT_USER\\Software\\MyApp"
     fn navigate_to_path(&mut self, full_path: &str) {
+        self.navigate_to_path_internal(full_path, true);
+    }
+
+    /// Navigate to a path, optionally checking if it exists first.
+    /// Use check_exists=false for search results (they came from SQLite, so they exist).
+    fn navigate_to_path_internal(&mut self, full_path: &str, check_exists: bool) {
         // Parse "HKEY_XXX\path\to\key"
         let parts: Vec<&str> = full_path.splitn(2, '\\').collect();
         let root_name = parts[0];
         let sub_path = if parts.len() > 1 { parts[1] } else { "" };
 
         if let Some(root) = RootKey::from_name(root_name) {
-            // Verify the key actually exists in our SQLite store
-            if !sub_path.is_empty() {
+            // Optionally verify the key exists in our SQLite store
+            if check_exists && !sub_path.is_empty() {
                 if !self.store.key_exists(&root, sub_path) {
                     // Key doesn't exist — treat input as a search
                     self.run_path_bar_search(full_path);
@@ -435,12 +458,15 @@ impl RegistryEditorApp {
 
     fn run_path_bar_search(&mut self, query: &str) {
         self.search_options.query = query.to_string();
+        self.last_executed_query = query.to_string();
+        self.search_results_snapshot.clear();
         self.active_panel = Panel::Search;
         // Use SQLite-based search from the sync store
-        rust_hive::search::start_search(
+        rust_hive::search::start_search_with_store(
             self.search_options.clone(),
             self.search_state.clone(),
-            None, // No longer using the old index
+            self.store.clone(),
+            true, // fallback to live registry if SQLite finds nothing
         );
         self.status_message = format!("Searching for \"{}\"...", query);
     }
@@ -482,12 +508,12 @@ impl RegistryEditorApp {
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Export .reg file...").clicked() {
-                    self.export_reg_file();
+                if ui.button("Open .reg file...").clicked() {
+                    self.import_reg_file();
                     ui.close_menu();
                 }
-                if ui.button("Import .reg file...").clicked() {
-                    self.import_reg_file();
+                if ui.button("Save .reg file...").clicked() {
+                    self.export_reg_file();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -592,7 +618,7 @@ impl RegistryEditorApp {
                 }
             });
 
-            // Sync menu
+            // Sync menu - just the sync actions
             ui.menu_button("Sync", |ui| {
                 let pending = self.store.pending_change_count();
                 let is_syncing = self.store.is_syncing.load(Ordering::Relaxed);
@@ -631,23 +657,46 @@ impl RegistryEditorApp {
                     self.edit_dialog = EditDialog::ConfirmDiscardChanges;
                     ui.close_menu();
                 }
+            });
 
+            // Tools menu with Options
+            ui.menu_button("Tools", |ui| {
+                ui.menu_button("Options", |ui| {
+                    ui.label(egui::RichText::new("Sync Mode").strong());
+                    if ui.radio(self.sync_mode == SyncMode::Manual, "Manual - stage changes before pushing").clicked() {
+                        self.sync_mode = SyncMode::Manual;
+                        self.store.save_setting("sync_mode", "manual");
+                    }
+                    if ui.radio(self.sync_mode == SyncMode::AutoSync, "Auto-sync - push changes immediately").clicked() {
+                        self.sync_mode = SyncMode::AutoSync;
+                        self.store.save_setting("sync_mode", "auto");
+                    }
+                    
+                    ui.separator();
+                    ui.label(egui::RichText::new("Background Sync").strong());
+                    let mut auto_pull = self.store.auto_pull_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut auto_pull, "Enable background sync from registry").changed() {
+                        self.store.auto_pull_enabled.store(auto_pull, Ordering::SeqCst);
+                        self.store.save_auto_pull_enabled();
+                    }
+                });
+                
                 ui.separator();
-                ui.label("Sync Mode:");
-                if ui.radio(self.sync_mode == SyncMode::Manual, "Manual").clicked() {
-                    self.sync_mode = SyncMode::Manual;
-                    self.store.save_setting("sync_mode", "manual");
+                
+                // Debug mode toggle
+                let debug_enabled = self.store.debug_enabled.load(Ordering::Relaxed);
+                let mut debug_mode = debug_enabled;
+                if ui.checkbox(&mut debug_mode, "Debug Mode").changed() {
+                    self.store.debug_enabled.store(debug_mode, Ordering::SeqCst);
+                    if debug_mode {
+                        self.show_debug_log = true;
+                    }
                 }
-                if ui.radio(self.sync_mode == SyncMode::AutoSync, "Auto-sync").clicked() {
-                    self.sync_mode = SyncMode::AutoSync;
-                    self.store.save_setting("sync_mode", "auto");
-                }
-
-                ui.separator();
-                let mut auto_pull = self.store.auto_pull_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut auto_pull, "Background sync").changed() {
-                    self.store.auto_pull_enabled.store(auto_pull, Ordering::SeqCst);
-                    self.store.save_auto_pull_enabled();
+                if debug_enabled {
+                    if ui.button("Open Debug Log...").clicked() {
+                        self.show_debug_log = true;
+                        ui.close_menu();
+                    }
                 }
             });
         });
@@ -943,19 +992,25 @@ impl RegistryEditorApp {
 
             let is_searching = self.search_state.is_searching.load(Ordering::Relaxed);
 
+            // Allow canceling search with Escape key
+            if is_searching && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.search_state.cancel.store(true, Ordering::SeqCst);
+            }
+
             if !is_searching {
-                if ui.button("Search").clicked()
-                    || (response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                {
-                    if !self.search_options.query.is_empty() {
-                        // Use the sync store's search or fall back to live search
-                        rust_hive::search::start_search(
-                            self.search_options.clone(),
-                            self.search_state.clone(),
-                            None,
-                        );
-                    }
+                let search_clicked = ui.button("Search").clicked();
+                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                
+                if (search_clicked || enter_pressed) && !self.search_options.query.is_empty() {
+                    // Run search - SQLite first, then live registry fallback
+                    self.last_executed_query = self.search_options.query.clone();
+                    self.search_results_snapshot.clear();
+                    rust_hive::search::start_search_with_store(
+                        self.search_options.clone(),
+                        self.search_state.clone(),
+                        self.store.clone(),
+                        true, // Enable live fallback for comprehensive search
+                    );
                 }
             } else {
                 if ui.button("Cancel").clicked() {
@@ -1169,90 +1224,129 @@ impl RegistryEditorApp {
         if is_searching {
             let scanned = self.search_state.keys_scanned.load(Ordering::Relaxed);
             let count = self.search_state.results.lock().unwrap().len();
-            let current = self.search_state.current_path.lock().unwrap().clone();
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!(
-                    "Searching... {} keys scanned, {} results",
+                    "Searching... {} keys scanned, {} found",
                     scanned, count
                 ));
             });
-            if !current.is_empty() {
-                ui.label(
-                    egui::RichText::new(&current)
-                        .small()
-                        .color(egui::Color32::GRAY),
-                );
-            }
             ui.ctx().request_repaint();
-
-            // Update snapshot periodically
-            self.search_results_snapshot =
-                self.search_state.results.lock().unwrap().clone();
-        } else if !self.search_results_snapshot.is_empty()
-            || !self.search_state.results.lock().unwrap().is_empty()
-        {
-            // Final snapshot
-            let results = self.search_state.results.lock().unwrap();
-            if results.len() != self.search_results_snapshot.len() {
-                self.search_results_snapshot = results.clone();
+            // Don't show results while searching - wait until complete
+        } else if !self.last_executed_query.is_empty() {
+            // Search completed - update snapshot with final results (only once when search finishes)
+            if self.was_searching_last_frame {
+                self.search_results_snapshot = self.search_state.results.lock().unwrap().clone();
             }
-            drop(results);
-            ui.label(format!("{} results", self.search_results_snapshot.len()));
+            
+            if self.search_results_snapshot.is_empty() {
+                ui.label(format!("No results for \"{}\"", self.last_executed_query));
+            } else {
+                ui.label(format!("{} results", self.search_results_snapshot.len()));
+            }
         }
 
-        // Results list
-        egui::ScrollArea::both().show(ui, |ui| {
-            let mut navigate_to: Option<String> = None;
+        // Results list - only show when not searching
+        let mut navigate_to: Option<String> = None;
+        
+        if !is_searching {
+            egui::ScrollArea::both().show(ui, |ui| {
+                for (idx, result) in self.search_results_snapshot.iter().enumerate() {
+                    let icon = match result.match_type {
+                        MatchType::KeyName => "🔑",
+                        MatchType::ValueName => "📝",
+                        MatchType::ValueData => "📄",
+                    };
 
-            for result in &self.search_results_snapshot {
-                let icon = match result.match_type {
-                    MatchType::KeyName => "K",
-                    MatchType::ValueName => "N",
-                    MatchType::ValueData => "D",
-                };
+                    // Alternating background for better visual separation
+                    let bg_color = if idx % 2 == 0 {
+                        egui::Color32::from_rgba_unmultiplied(60, 60, 80, 255)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(40, 40, 55, 255)
+                    };
 
-                let text = if let Some(ref vname) = result.value_name {
-                    format!(
-                        "[{}] {}\\{} = {}",
-                        icon,
-                        result.full_path(),
-                        vname,
-                        result.value_data.as_deref().unwrap_or("")
-                    )
-                } else {
-                    format!("[{}] {}", icon, result.full_path())
-                };
+                    let text_color = match result.match_type {
+                        MatchType::KeyName => egui::Color32::from_rgb(100, 180, 255),
+                        MatchType::ValueName => egui::Color32::from_rgb(100, 255, 100),
+                        MatchType::ValueData => egui::Color32::from_rgb(255, 200, 100),
+                    };
 
-                let resp = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&text).small().color(
-                            match result.match_type {
-                                MatchType::KeyName => egui::Color32::from_rgb(100, 180, 255),
-                                MatchType::ValueName => egui::Color32::from_rgb(100, 255, 100),
-                                MatchType::ValueData => egui::Color32::from_rgb(255, 200, 100),
-                            },
-                        ),
-                    )
-                    .sense(egui::Sense::click()),
-                );
+                    egui::Frame::new()
+                        .fill(bg_color)
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .outer_margin(egui::Margin::symmetric(0, 1))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                        .corner_radius(3.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(icon);
+                                
+                                let path_text = result.full_path();
+                                let display_text = if let Some(ref vname) = result.value_name {
+                                    format!(
+                                        "{}\\{} = {}",
+                                        path_text,
+                                        vname,
+                                        result.value_data.as_deref().unwrap_or("")
+                                    )
+                                } else {
+                                    path_text.clone()
+                                };
 
-                if resp.clicked() {
-                    navigate_to = Some(result.full_path());
+                                let resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&display_text).small().color(text_color),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+
+                                if resp.clicked() {
+                                    navigate_to = Some(result.full_path());
+                                }
+
+                                resp.on_hover_text(format!(
+                                    "Match: {}\nPath: {}",
+                                    result.match_type,
+                                    result.full_path()
+                                ));
+                            });
+                        });
                 }
-
-                resp.on_hover_text(format!(
-                    "Match: {}\nPath: {}",
-                    result.match_type,
-                    result.full_path()
-                ));
+            });
+        }
+        
+        // Handle navigation outside the scroll area closure
+        if let Some(path) = navigate_to {
+            // Ensure parent keys are cached so the tree can display them
+            self.ensure_path_cached(&path);
+            self.navigate_to_path_internal(&path, false);
+            // Stay on search panel - don't switch to tree
+        }
+    }
+    
+    /// Ensure all keys in a path are cached in SQLite so the tree can display them.
+    fn ensure_path_cached(&self, full_path: &str) {
+        let parts: Vec<&str> = full_path.splitn(2, '\\').collect();
+        let root_name = parts[0];
+        let sub_path = if parts.len() > 1 { parts[1] } else { "" };
+        
+        if let Some(root) = RootKey::from_name(root_name) {
+            // Cache each segment of the path
+            let mut cumulative = String::new();
+            for segment in sub_path.split('\\') {
+                if segment.is_empty() {
+                    continue;
+                }
+                let parent = cumulative.clone();
+                if cumulative.is_empty() {
+                    cumulative = segment.to_string();
+                } else {
+                    cumulative = format!("{}\\{}", cumulative, segment);
+                }
+                // Trigger a fetch for this path segment (will cache if not already)
+                self.store.fetch_subkeys_async(&root, &parent);
             }
-
-            if let Some(path) = navigate_to {
-                self.navigate_to_path(&path);
-                self.active_panel = Panel::Tree;
-            }
-        });
+        }
     }
 
     fn show_bookmarks_panel(&mut self, ui: &mut egui::Ui) {
@@ -2446,95 +2540,130 @@ impl RegistryEditorApp {
     }
 
     fn export_reg_file(&self) {
-        if self.selected_root.is_none() {
-            return;
-        }
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Export .reg file")
+        let root = match &self.selected_root {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        if let Some(file_path) = rfd::FileDialog::new()
+            .set_title("Save .reg file")
             .add_filter("Registry Files", &["reg"])
             .add_filter("All Files", &["*"])
             .save_file()
         {
             let mut content = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-            let full_path = self.full_path();
-            content.push_str(&format!("[{}]\r\n", full_path));
-
-            for val in &self.values {
-                let name_str = if val.name.is_empty() {
-                    "@".to_string()
+            
+            // Recursively export the selected key and all children
+            let mut keys_to_export: Vec<String> = vec![self.selected_path.clone()];
+            let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            
+            while let Some(current_path) = keys_to_export.pop() {
+                if processed.contains(&current_path) {
+                    continue;
+                }
+                processed.insert(current_path.clone());
+                
+                // Build full path for this key
+                let full_path = if current_path.is_empty() {
+                    root.to_string()
                 } else {
-                    format!("\"{}\"", val.name.replace('\\', "\\\\").replace('"', "\\\""))
+                    format!("{}\\{}", root, current_path)
                 };
+                
+                content.push_str(&format!("[{}]\r\n", full_path));
+                
+                // Get values for this key
+                if let Ok(values) = self.store.get_values(&root, &current_path) {
+                    for val in &values {
+                        let name_str = if val.name.is_empty() {
+                            "@".to_string()
+                        } else {
+                            format!("\"{}\"", val.name.replace('\\', "\\\\").replace('"', "\\\""))
+                        };
 
-                let data_str = match &val.data {
-                    RegValue::String(s) => {
-                        format!(
-                            "\"{}\"",
-                            s.replace('\\', "\\\\").replace('"', "\\\"")
-                        )
-                    }
-                    RegValue::ExpandString(s) => {
-                        let hex: String = s
-                            .encode_utf16()
-                            .chain(std::iter::once(0))
-                            .flat_map(|c| {
-                                let bytes = c.to_le_bytes();
-                                vec![
-                                    format!("{:02x}", bytes[0]),
-                                    format!("{:02x}", bytes[1]),
-                                ]
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("hex(2):{}", hex)
-                    }
-                    RegValue::Dword(d) => format!("dword:{:08x}", d),
-                    RegValue::Qword(q) => {
-                        let bytes = q.to_le_bytes();
-                        let hex = bytes
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("hex(b):{}", hex)
-                    }
-                    RegValue::Binary(b) => {
-                        let hex = b
-                            .iter()
-                            .map(|byte| format!("{:02x}", byte))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("hex:{}", hex)
-                    }
-                    RegValue::MultiString(strings) => {
-                        let hex: String = strings
-                            .iter()
-                            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
-                            .chain(std::iter::once(0))
-                            .flat_map(|c| {
-                                let bytes = c.to_le_bytes();
-                                vec![
-                                    format!("{:02x}", bytes[0]),
-                                    format!("{:02x}", bytes[1]),
-                                ]
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("hex(7):{}", hex)
-                    }
-                    _ => continue,
-                };
+                        let data_str = match &val.data {
+                            RegValue::String(s) => {
+                                format!(
+                                    "\"{}\"",
+                                    s.replace('\\', "\\\\").replace('"', "\\\"")
+                                )
+                            }
+                            RegValue::ExpandString(s) => {
+                                let hex: String = s
+                                    .encode_utf16()
+                                    .chain(std::iter::once(0))
+                                    .flat_map(|c| {
+                                        let bytes = c.to_le_bytes();
+                                        vec![
+                                            format!("{:02x}", bytes[0]),
+                                            format!("{:02x}", bytes[1]),
+                                        ]
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("hex(2):{}", hex)
+                            }
+                            RegValue::Dword(d) => format!("dword:{:08x}", d),
+                            RegValue::Qword(q) => {
+                                let bytes = q.to_le_bytes();
+                                let hex = bytes
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("hex(b):{}", hex)
+                            }
+                            RegValue::Binary(b) => {
+                                let hex = b
+                                    .iter()
+                                    .map(|byte| format!("{:02x}", byte))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("hex:{}", hex)
+                            }
+                            RegValue::MultiString(strings) => {
+                                let hex: String = strings
+                                    .iter()
+                                    .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
+                                    .chain(std::iter::once(0))
+                                    .flat_map(|c| {
+                                        let bytes = c.to_le_bytes();
+                                        vec![
+                                            format!("{:02x}", bytes[0]),
+                                            format!("{:02x}", bytes[1]),
+                                        ]
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                format!("hex(7):{}", hex)
+                            }
+                            _ => continue,
+                        };
 
-                content.push_str(&format!("{}={}\r\n", name_str, data_str));
+                        content.push_str(&format!("{}={}\r\n", name_str, data_str));
+                    }
+                }
+                
+                content.push_str("\r\n");
+                
+                // Get subkeys and add them to the list to process
+                let subkeys = self.store.get_subkeys(&root, &current_path);
+                for subkey in subkeys {
+                    let child_path = if current_path.is_empty() {
+                        subkey
+                    } else {
+                        format!("{}\\{}", current_path, subkey)
+                    };
+                    keys_to_export.push(child_path);
+                }
             }
 
-            std::fs::write(path, content).ok();
+            std::fs::write(file_path, content).ok();
         }
     }
 
     fn import_reg_file(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Import .reg file")
+            .set_title("Open .reg file")
             .add_filter("Registry Files", &["reg"])
             .add_filter("All Files", &["*"])
             .pick_file()
@@ -2630,14 +2759,50 @@ impl RegistryEditorApp {
     }
 }
 
+/// Format bytes as human-readable string (KB, MB, GB).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Get the current process's working set (memory usage) in bytes.
+#[cfg(windows)]
+fn get_process_memory_bytes() -> u64 {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        
+        if GetProcessMemoryInfo(handle, &mut pmc, pmc.cb).is_ok() {
+            pmc.WorkingSetSize as u64
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn get_process_memory_bytes() -> u64 {
+    0 // Not implemented for non-Windows
+}
+
 /// Shows a floating debug overlay with live performance metrics.
 impl RegistryEditorApp {
     fn show_debug_overlay(&self, ctx: &egui::Context) {
         let in_flight = self.store.pending_fetches.load(Ordering::Relaxed);
-        let cached_keys = {
-            // Just count cache entries — single lock, no heavy work
-            self.store.subkey_cache_len()
-        };
+        let cached_keys = self.store.subkey_cache_len();
+        let db_size_bytes = self.store.get_db_size_bytes();
+        let memory_bytes = get_process_memory_bytes();
 
         egui::Window::new("Debug Overlay")
             .resizable(false)
@@ -2665,8 +2830,103 @@ impl RegistryEditorApp {
                     ui.label("Cached paths:");
                     ui.label(format!("{}", cached_keys));
                     ui.end_row();
+
+                    ui.label("SQLite DB size:");
+                    ui.label(format_bytes(db_size_bytes));
+                    ui.end_row();
+
+                    ui.label("App memory:");
+                    ui.label(format_bytes(memory_bytes));
+                    ui.end_row();
                 });
             });
+    }
+
+    /// Shows the debug log window with registry reads and SQLite writes.
+    fn show_debug_log_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_debug_log;
+        egui::Window::new("Debug Log")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([600.0, 400.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    if ui.selectable_label(self.debug_log_filter.is_none(), "All").clicked() {
+                        self.debug_log_filter = None;
+                    }
+                    if ui.selectable_label(self.debug_log_filter == Some(DebugCategory::RegistryRead), "Reg Read").clicked() {
+                        self.debug_log_filter = Some(DebugCategory::RegistryRead);
+                    }
+                    if ui.selectable_label(self.debug_log_filter == Some(DebugCategory::RegistryWrite), "Reg Write").clicked() {
+                        self.debug_log_filter = Some(DebugCategory::RegistryWrite);
+                    }
+                    if ui.selectable_label(self.debug_log_filter == Some(DebugCategory::SqliteRead), "SQL Read").clicked() {
+                        self.debug_log_filter = Some(DebugCategory::SqliteRead);
+                    }
+                    if ui.selectable_label(self.debug_log_filter == Some(DebugCategory::SqliteWrite), "SQL Write").clicked() {
+                        self.debug_log_filter = Some(DebugCategory::SqliteWrite);
+                    }
+                    if ui.selectable_label(self.debug_log_filter == Some(DebugCategory::Cache), "Cache").clicked() {
+                        self.debug_log_filter = Some(DebugCategory::Cache);
+                    }
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Clear").clicked() {
+                            self.store.clear_debug_log();
+                        }
+                    });
+                });
+                
+                ui.separator();
+                
+                let events = self.store.get_debug_log();
+                
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for event in events.iter().rev().take(500) {
+                            // Apply filter
+                            if let Some(filter) = self.debug_log_filter {
+                                if event.category != filter {
+                                    continue;
+                                }
+                            }
+                            
+                            // Format timestamp as HH:MM:SS.mmm
+                            let time_str = if let Ok(duration) = event.timestamp.duration_since(std::time::UNIX_EPOCH) {
+                                let total_secs = duration.as_secs();
+                                let hours = (total_secs / 3600) % 24;
+                                let minutes = (total_secs / 60) % 60;
+                                let seconds = total_secs % 60;
+                                let millis = duration.subsec_millis();
+                                format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+                            } else {
+                                "??:??:??".to_string()
+                            };
+                            
+                            let (category_str, color) = match event.category {
+                                DebugCategory::RegistryRead => ("REG_RD", egui::Color32::from_rgb(100, 180, 255)),
+                                DebugCategory::RegistryWrite => ("REG_WR", egui::Color32::from_rgb(255, 150, 100)),
+                                DebugCategory::SqliteRead => ("SQL_RD", egui::Color32::from_rgb(150, 255, 150)),
+                                DebugCategory::SqliteWrite => ("SQL_WR", egui::Color32::from_rgb(255, 255, 100)),
+                                DebugCategory::Cache => ("CACHE", egui::Color32::from_rgb(200, 150, 255)),
+                            };
+                            
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&time_str).weak().monospace());
+                                ui.label(egui::RichText::new(category_str).color(color).monospace());
+                                ui.label(&event.message);
+                            });
+                        }
+                        
+                        if events.is_empty() {
+                            ui.label("No events yet. Enable debug mode and interact with the registry to see events.");
+                        }
+                    });
+            });
+        self.show_debug_log = open;
     }
 }
 
@@ -2788,6 +3048,11 @@ impl eframe::App for RegistryEditorApp {
             self.show_debug_overlay(ctx);
         }
 
+        // Debug log window (non-modal)
+        if self.show_debug_log {
+            self.show_debug_log_window(ctx);
+        }
+
         // Keep repainting while background fetches or a full sync are in flight.
         // When a full sync completes, refresh values and check for conflicts.
         let is_syncing = self.store.is_syncing.load(Ordering::Relaxed);
@@ -2804,7 +3069,15 @@ impl eframe::App for RegistryEditorApp {
             } else {
                 self.status_message = "Sync complete".to_string();
             }
+        } else if self.had_pending_fetches {
+            // Async value fetch just finished — refresh values panel
+            self.refresh_values();
         }
         self.was_syncing = is_syncing;
+        self.had_pending_fetches = has_pending_fetches;
+        
+        // Track search state for detecting search completion
+        let is_searching = self.search_state.is_searching.load(Ordering::Relaxed);
+        self.was_searching_last_frame = is_searching;
     }
 }

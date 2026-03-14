@@ -22,6 +22,8 @@ windows = { version = "0.59", features = [
     "Win32_System_Registry",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
 
 # Build with windows subsystem to avoid console window
