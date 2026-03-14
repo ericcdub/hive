@@ -5,9 +5,13 @@ edition = "2021"
 authors = ["Eric Chubb"]
 license = "MIT"
 description = "A modern Windows Registry editor with SQLite caching"
+repository = "https://github.com/YOUR_USERNAME/hive"
 
 [dependencies]
-rust-hive = { path = "crates/rust-hive" }
+# TODO: Update with your GitHub username once the repo is created
+# rust-hive = { git = "https://github.com/YOUR_USERNAME/rust-hive" }
+# For now, use local path during development:
+rust-hive = { path = "../rust-hive" }
 eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
 egui_extras = "0.31"
