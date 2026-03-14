@@ -22,7 +22,7 @@ A modern, SQLite-first Windows Registry editor built with Rust and egui.
 ### From Source
 
 ```bash
-git clone https://github.com/echubb/hive.git
+git clone https://github.com/ericcdub/hive.git
 cd hive
 cargo build --release
 ```
@@ -56,15 +56,10 @@ hive/
 ├── src/
 │   ├── main.rs      # Application entry point
 │   └── app.rs       # Main UI (egui)
-├── crates/
-│   └── rust-hive/   # Registry access library
-│       ├── src/
-│       │   ├── registry.rs  # Windows Registry API wrapper
-│       │   ├── sync.rs      # SQLite storage and sync
-│       │   ├── search.rs    # Search functionality
-│       │   └── bookmarks.rs # Bookmark management
-│       └── Cargo.toml
 └── Cargo.toml
+
+# rust-hive is a separate repo:
+# https://github.com/ericcdub/rust-hive
 ```
 
 ## Rust Hive Library
@@ -73,7 +68,7 @@ The `rust-hive` crate can be used independently for Windows Registry access:
 
 ```toml
 [dependencies]
-rust-hive = { git = "https://github.com/echubb/hive.git" }
+rust-hive = { git = "https://github.com/ericcdub/rust-hive" }
 ```
 
 ```rust
