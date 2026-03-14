@@ -76,6 +76,7 @@ use rust_hive::sync::{PendingChange, SyncConflict, SyncStore};
 // External crate imports
 use eframe::egui;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // UI STATE ENUMS
@@ -276,6 +277,17 @@ pub struct RegistryEditorApp {
     
     /// Track if we were syncing last frame (to detect completion)
     was_syncing: bool,
+
+    /// Whether the debug overlay window is open
+    show_profiler: bool,
+
+    // ── Debug / profiling stats ───────────────────────────────────────────────
+    /// Wall-clock time of the last frame start (for frame-time measurement)
+    last_frame_start: Option<Instant>,
+    /// How long the last full update() took
+    last_frame_ms: f32,
+    /// How long render_tree_nodes() took last frame
+    last_tree_render_us: u64,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -295,12 +307,24 @@ impl RegistryEditorApp {
     ///
     /// `CreationContext` provides access to egui's context during creation.
     /// We prefix with `_` because we don't use it, but the trait requires it.
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Clear any stale egui widget state from previous sessions.
+        // Without this, expanding keys with thousands of subkeys (e.g., HKCR) causes egui
+        // to persist tens of thousands of CollapsingHeader states to app.ron (~600KB+),
+        // which makes the app unresponsive or invisible on the next launch.
+        // Tree expand/collapse state is managed by our own `expanded_keys` set, so we
+        // don't need egui's persistence for it.
+        cc.egui_ctx.memory_mut(|m| m.data.clear());
+
         // Create the store - this opens/creates the SQLite database
+        // Settings are automatically loaded from the database
         let store = SyncStore::new();
         
-        // Start background sync to populate cache from registry
-        store.start_background_pull();
+        // Load sync_mode preference
+        let sync_mode = match store.load_setting("sync_mode").as_deref() {
+            Some("auto") => SyncMode::AutoSync,
+            _ => SyncMode::Manual,
+        };
 
         Self {
             // Navigation - start with nothing selected
@@ -319,7 +343,7 @@ impl RegistryEditorApp {
             
             // Backend
             store,
-            sync_mode: SyncMode::Manual,
+            sync_mode,
             
             // UI state
             active_panel: Panel::Tree,
@@ -330,6 +354,10 @@ impl RegistryEditorApp {
             show_search_options: false,
             show_sync_settings: false,
             was_syncing: false,
+            show_profiler: false,
+            last_frame_start: None,
+            last_frame_ms: 0.0,
+            last_tree_render_us: 0,
         }
     }
 
@@ -419,20 +447,17 @@ impl RegistryEditorApp {
 
     fn refresh_values(&mut self) {
         if let Some(ref root) = self.selected_root {
-            match self.store.get_values(root, &self.selected_path) {
-                Ok(vals) => self.values = vals,
-                Err(e) => {
-                    self.values.clear();
-                    self.status_message = format!("Error: {}", e);
-                }
+            // Use non-blocking version - only returns cached data
+            self.values = self.store.get_values_cached_only(root, &self.selected_path);
+            
+            // If no cached data, trigger async fetch (won't block UI)
+            if self.values.is_empty() && !self.store.has_cached_values(root, &self.selected_path) {
+                self.store.fetch_values_async(root, &self.selected_path);
             }
             self.selected_value = None;
         }
     }
 
-    fn get_subkeys_cached(&mut self, root: &RootKey, path: &str) -> Vec<String> {
-        self.store.get_subkeys(root, path)
-    }
 
     /// If auto-sync is enabled, immediately push changes to the registry
     fn maybe_auto_sync(&mut self) {
@@ -561,6 +586,10 @@ impl RegistryEditorApp {
                     self.refresh_values();
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui.checkbox(&mut self.show_profiler, "Debug Overlay").clicked() {
+                    ui.close_menu();
+                }
             });
 
             // Sync menu
@@ -607,9 +636,18 @@ impl RegistryEditorApp {
                 ui.label("Sync Mode:");
                 if ui.radio(self.sync_mode == SyncMode::Manual, "Manual").clicked() {
                     self.sync_mode = SyncMode::Manual;
+                    self.store.save_setting("sync_mode", "manual");
                 }
                 if ui.radio(self.sync_mode == SyncMode::AutoSync, "Auto-sync").clicked() {
                     self.sync_mode = SyncMode::AutoSync;
+                    self.store.save_setting("sync_mode", "auto");
+                }
+
+                ui.separator();
+                let mut auto_pull = self.store.auto_pull_enabled.load(Ordering::Relaxed);
+                if ui.checkbox(&mut auto_pull, "Background sync").changed() {
+                    self.store.auto_pull_enabled.store(auto_pull, Ordering::SeqCst);
+                    self.store.save_auto_pull_enabled();
                 }
             });
         });
@@ -680,12 +718,13 @@ impl RegistryEditorApp {
 
     fn show_tree_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::both().show(ui, |ui| {
-            // Collect tree items to render
             let mut nodes_to_render: Vec<(RootKey, String)> = Vec::new();
             for root in RootKey::all() {
                 nodes_to_render.push((root.clone(), String::new()));
             }
+            let t = Instant::now();
             self.render_tree_nodes(ui, &nodes_to_render);
+            self.last_tree_render_us = t.elapsed().as_micros() as u64;
         });
     }
 
@@ -706,13 +745,31 @@ impl RegistryEditorApp {
             let is_selected = self.selected_root.as_ref() == Some(root)
                 && self.selected_path == *path;
 
-            let subkeys = self.get_subkeys_cached(root, path);
-            // Root keys (empty path) always have children, show as expandable
-            let has_children = !subkeys.is_empty() || path.is_empty();
+            // Single mutex acquire: returns (subkeys, is_fetched).
+            // Root keys (path="") are NOT treated as pre-fetched — they must be fetched
+            // the same way as any other key when first opened.
+            let (subkeys, is_fetched) = self.store.get_subkeys_cached(root, path);
+            
+            // Trigger fetch immediately when rendering an unfetched non-root node.
+            // This ensures we know the node's leaf status by the next frame.
+            // The fetch is a no-op if already in-flight.
+            if !is_fetched && !path.is_empty() {
+                self.store.fetch_subkeys_async(root, path);
+            }
+            
+            // Determine if this node should show an expand arrow:
+            // - Root keys always have children (show arrow)
+            // - Nodes with children in cache (show arrow)
+            // - Unfetched nodes (show arrow - optimistic, might have children)
+            // - Fetched nodes with no children: confirmed leaf (no arrow)
+            let is_root_key = path.is_empty();
+            let is_confirmed_leaf = is_fetched && subkeys.is_empty() && !is_root_key;
 
-            if has_children {
+            if !is_confirmed_leaf {
+                // Node with children (or might have children) - show expand arrow
                 let default_open = self.expanded_keys.contains(&full_key);
                 let id = ui.make_persistent_id(&full_key);
+                
                 let resp = egui::CollapsingHeader::new(
                     if is_selected {
                         egui::RichText::new(&display_name).strong()
@@ -723,8 +780,17 @@ impl RegistryEditorApp {
                 .id_salt(id)
                 .default_open(default_open)
                 .show(ui, |ui| {
-                    let child_nodes: Vec<(RootKey, String)> = subkeys
-                        .iter()
+                    // Fetch when node is open (needed for root nodes)
+                    if !is_fetched {
+                        self.store.fetch_subkeys_async(root, path);
+                    }
+                    
+                    // Cap visible children to avoid egui laying out thousands of widgets
+                    const MAX_CHILDREN: usize = 500;
+                    let total = subkeys.len();
+                    let visible = subkeys.iter().take(MAX_CHILDREN);
+
+                    let child_nodes: Vec<(RootKey, String)> = visible
                         .map(|subkey| {
                             let child_path = if path.is_empty() {
                                 subkey.clone()
@@ -735,12 +801,23 @@ impl RegistryEditorApp {
                         })
                         .collect();
                     self.render_tree_nodes(ui, &child_nodes);
+
+                    if total > MAX_CHILDREN {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "… {} more keys (use search to navigate)",
+                                total - MAX_CHILDREN
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
                 });
 
-                // Track expansion state
-                if resp.openness > 0.0 {
+                // Track expansion state based on fully open/closed, not animation
+                if resp.fully_open() {
                     self.expanded_keys.insert(full_key.clone());
-                } else {
+                } else if resp.fully_closed() {
                     self.expanded_keys.remove(&full_key);
                 }
 
@@ -755,16 +832,29 @@ impl RegistryEditorApp {
                 // Context menu
                 self.tree_node_context_menu(&resp.header_response, root, path, &full_key);
             } else {
-                // Leaf node
-                let resp = ui.selectable_label(is_selected, &display_name);
+                // Confirmed leaf node - no expand arrow, clickable label
+                // Add horizontal spacing to align with CollapsingHeader text (arrow width ~19px)
+                let text = if is_selected {
+                    egui::RichText::new(format!("    {}", display_name)).strong()
+                } else {
+                    egui::RichText::new(format!("    {}", display_name))
+                };
+                let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                
+                // Select on click
                 if resp.clicked() {
                     self.selected_root = Some(root.clone());
                     self.selected_path = path.to_string();
                     self.path_bar = full_key.clone();
                     self.refresh_values();
                 }
-
-                // Context menu
+                
+                // If this node is selected but values haven't loaded yet, keep trying
+                // (handles race condition where click happens during node type transition)
+                if is_selected && self.values.is_empty() {
+                    self.refresh_values();
+                }
+                
                 self.tree_node_context_menu(&resp, root, path, &full_key);
             }
         }
@@ -1022,6 +1112,7 @@ impl RegistryEditorApp {
                     let mut enabled = self.store.auto_pull_enabled.load(Ordering::Relaxed);
                     if ui.checkbox(&mut enabled, "Auto-pull enabled").changed() {
                         self.store.auto_pull_enabled.store(enabled, Ordering::SeqCst);
+                        self.store.save_auto_pull_enabled();
                     }
 
                     ui.horizontal(|ui| {
@@ -1041,6 +1132,7 @@ impl RegistryEditorApp {
                         {
                             if let Ok(n) = secs.parse::<u64>() {
                                 *self.store.auto_pull_interval_secs.lock().unwrap() = n;
+                                self.store.save_auto_pull_interval();
                             }
                         }
                         ui.label("sec");
@@ -1063,6 +1155,7 @@ impl RegistryEditorApp {
                         {
                             *self.store.pull_max_depth.lock().unwrap() =
                                 depth_str.parse::<usize>().ok();
+                            self.store.save_pull_max_depth();
                         }
                     });
                 });
@@ -2537,6 +2630,46 @@ impl RegistryEditorApp {
     }
 }
 
+/// Shows a floating debug overlay with live performance metrics.
+impl RegistryEditorApp {
+    fn show_debug_overlay(&self, ctx: &egui::Context) {
+        let in_flight = self.store.pending_fetches.load(Ordering::Relaxed);
+        let cached_keys = {
+            // Just count cache entries — single lock, no heavy work
+            self.store.subkey_cache_len()
+        };
+
+        egui::Window::new("Debug Overlay")
+            .resizable(false)
+            .collapsible(true)
+            .default_pos([10.0, 60.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("debug_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Frame time:");
+                    ui.label(format!("{:.2} ms", self.last_frame_ms));
+                    ui.end_row();
+
+                    ui.label("Tree render:");
+                    ui.label(format!("{} µs", self.last_tree_render_us));
+                    ui.end_row();
+
+                    ui.label("In-flight fetches:");
+                    let color = if in_flight > 0 {
+                        egui::Color32::from_rgb(255, 200, 80)
+                    } else {
+                        egui::Color32::from_rgb(100, 200, 100)
+                    };
+                    ui.label(egui::RichText::new(format!("{}", in_flight)).color(color));
+                    ui.end_row();
+
+                    ui.label("Cached paths:");
+                    ui.label(format!("{}", cached_keys));
+                    ui.end_row();
+                });
+            });
+    }
+}
+
 /// Actions for bookmark management in the bookmarks panel.
 enum BookmarkAction {
     Remove(usize),
@@ -2547,6 +2680,13 @@ enum BookmarkAction {
 
 impl eframe::App for RegistryEditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Frame-time measurement
+        let frame_start = Instant::now();
+        if let Some(prev) = self.last_frame_start {
+            self.last_frame_ms = prev.elapsed().as_secs_f32() * 1000.0;
+        }
+        self.last_frame_start = Some(frame_start);
+
         // Handle keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
             self.store.pull_from_registry_async();
@@ -2642,5 +2782,29 @@ impl eframe::App for RegistryEditorApp {
 
         // Dialogs
         self.show_dialogs(ctx);
+
+        // Debug overlay
+        if self.show_profiler {
+            self.show_debug_overlay(ctx);
+        }
+
+        // Keep repainting while background fetches or a full sync are in flight.
+        // When a full sync completes, refresh values and check for conflicts.
+        let is_syncing = self.store.is_syncing.load(Ordering::Relaxed);
+        let has_pending_fetches = self.store.pending_fetches.load(Ordering::Relaxed) > 0;
+        if is_syncing || has_pending_fetches {
+            ctx.request_repaint();
+        } else if self.was_syncing {
+            // Sync just finished — refresh UI with latest data
+            self.refresh_values();
+            // Check for conflicts that the background push may have stored
+            let conflicts = self.store.take_pending_conflicts();
+            if !conflicts.is_empty() {
+                self.edit_dialog = EditDialog::SyncConflicts(conflicts);
+            } else {
+                self.status_message = "Sync complete".to_string();
+            }
+        }
+        self.was_syncing = is_syncing;
     }
 }
