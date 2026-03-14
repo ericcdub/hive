@@ -8,7 +8,9 @@ description = "A modern Windows Registry editor with SQLite caching"
 repository = "https://github.com/ericcdub/hive"
 
 [dependencies]
-rust-hive = { git = "https://github.com/ericcdub/rust-hive" }
+# Use local path during development, switch to git for release
+rust-hive = { path = "../rust-hive" }
+# rust-hive = { git = "https://github.com/ericcdub/rust-hive" }
 eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
 egui_extras = "0.31"

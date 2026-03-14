@@ -273,6 +273,9 @@ pub struct RegistryEditorApp {
     
     /// Whether sync settings panel is expanded
     show_sync_settings: bool,
+    
+    /// Track if we were syncing last frame (to detect completion)
+    was_syncing: bool,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -326,6 +329,7 @@ impl RegistryEditorApp {
             error_message: None,
             show_search_options: false,
             show_sync_settings: false,
+            was_syncing: false,
         }
     }
 
@@ -433,10 +437,7 @@ impl RegistryEditorApp {
     /// If auto-sync is enabled, immediately push changes to the registry
     fn maybe_auto_sync(&mut self) {
         if self.sync_mode == SyncMode::AutoSync {
-            let conflicts = self.store.push_to_registry();
-            if !conflicts.is_empty() {
-                self.edit_dialog = EditDialog::SyncConflicts(conflicts);
-            }
+            self.store.push_to_registry_async();
         }
     }
 
@@ -575,19 +576,14 @@ impl RegistryEditorApp {
 
                 if !is_syncing {
                     if ui.button("⬆ Push to Registry").clicked() {
-                        let conflicts = self.store.push_to_registry();
-                        if conflicts.is_empty() {
-                            self.status_message = "All changes pushed to registry".to_string();
-                        } else {
-                            self.edit_dialog = EditDialog::SyncConflicts(conflicts);
-                        }
+                        self.store.push_to_registry_async();
+                        self.status_message = "Pushing changes to registry...".to_string();
                         ui.close_menu();
                     }
 
                     if ui.button("⬇ Pull from Registry").clicked() {
-                        self.store.pull_from_registry();
-                        self.refresh_values();
-                        self.status_message = "Pulled latest from registry".to_string();
+                        self.store.pull_from_registry_async();
+                        self.status_message = "Pulling latest from registry...".to_string();
                         ui.close_menu();
                     }
                 } else {
@@ -1003,12 +999,8 @@ impl RegistryEditorApp {
                             .color(egui::Color32::from_rgb(255, 200, 100)),
                     );
                     if ui.small_button("Push").clicked() {
-                        let conflicts = self.store.push_to_registry();
-                        if !conflicts.is_empty() {
-                            self.edit_dialog = EditDialog::SyncConflicts(conflicts);
-                        } else {
-                            self.status_message = "All changes pushed to registry".to_string();
-                        }
+                        self.store.push_to_registry_async();
+                        self.status_message = "Pushing changes...".to_string();
                     }
                 } else {
                     ui.label(
@@ -1019,9 +1011,8 @@ impl RegistryEditorApp {
                 }
 
                 if ui.small_button("Pull").clicked() {
-                    self.store.pull_from_registry();
-                    self.refresh_values();
-                    self.status_message = "Pulled latest from registry".to_string();
+                    self.store.pull_from_registry_async();
+                    self.status_message = "Pulling...".to_string();
                 }
             });
 
@@ -1302,13 +1293,8 @@ impl RegistryEditorApp {
         ui.horizontal(|ui| {
             if !is_syncing {
                 if ui.button("⬆ Push All to Registry").clicked() {
-                    let conflicts = self.store.push_to_registry();
-                    if conflicts.is_empty() {
-                        self.status_message = "All changes pushed to registry".to_string();
-                        self.active_panel = Panel::Tree;
-                    } else {
-                        self.edit_dialog = EditDialog::SyncConflicts(conflicts);
-                    }
+                    self.store.push_to_registry_async();
+                    self.status_message = "Pushing changes to registry...".to_string();
                 }
                 if ui.button("Discard All").clicked() {
                     self.edit_dialog = EditDialog::ConfirmDiscardChanges;
@@ -2335,9 +2321,8 @@ impl RegistryEditorApp {
                         ui.horizontal(|ui| {
                             if ui.button("Discard All").clicked() {
                                 self.store.discard_all_pending_changes();
-                                self.store.pull_from_registry();
-                                self.refresh_values();
-                                self.status_message = "All pending changes discarded".to_string();
+                                self.store.pull_from_registry_async();
+                                self.status_message = "Discarding and reloading from registry...".to_string();
                                 close_dialog = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -2539,11 +2524,10 @@ impl RegistryEditorApp {
                     }
 
                     self.status_message = format!(
-                        "Import complete: {} values imported, {} errors",
+                        "Import complete: {} values imported, {} errors. Refreshing...",
                         imported, errors
                     );
-                    self.store.pull_from_registry();
-                    self.refresh_values();
+                    self.store.pull_from_registry_async();
                 }
                 Err(e) => {
                     self.error_message = Some(format!("Failed to read file: {}", e));
@@ -2565,8 +2549,8 @@ impl eframe::App for RegistryEditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.store.pull_from_registry();
-            self.refresh_values();
+            self.store.pull_from_registry_async();
+            self.status_message = "Refreshing from registry...".to_string();
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.active_panel = Panel::Search;
