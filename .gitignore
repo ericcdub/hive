@@ -1,0 +1,23 @@
+# Build artifacts
+/target
+crates/*/target
+
+# Cargo lock - optional for binaries, often included
+# Cargo.lock
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust
+**/*.rs.bk
+
+# Local config
+.cargo/config.toml
