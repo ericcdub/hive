@@ -224,6 +224,18 @@ pub struct RegistryEditorApp {
     
     /// Index of selected value in the values list, if any.
     selected_value: Option<usize>,
+    
+    /// Flag to reset values scroll area to top-left on next frame
+    reset_values_scroll: bool,
+    
+    /// Flag to reset search results scroll area to top-left on next frame
+    reset_search_scroll: bool,
+    
+    /// Flag to scroll the tree to show the selected key
+    scroll_tree_to_selected: bool,
+    
+    /// Frames remaining to attempt tree scroll (timeout protection)
+    scroll_tree_frames_remaining: u8,
 
     // ─────────────────────────────────────────────────────────────────────
     // Search State - Managing search operations
@@ -242,6 +254,14 @@ pub struct RegistryEditorApp {
     /// The last search query that was executed.
     /// Used to avoid re-running the same search on Enter.
     last_executed_query: String,
+    
+    /// Timestamp of the last keystroke in the search box (for debouncing).
+    /// Search starts 500ms after the user stops typing.
+    search_debounce_start: Option<Instant>,
+    
+    /// The query text when debounce timer started.
+    /// If this differs from current query, timer resets.
+    search_debounce_query: String,
 
     // ─────────────────────────────────────────────────────────────────────
     // Backend - Database and sync
@@ -333,6 +353,9 @@ impl RegistryEditorApp {
         // Settings are automatically loaded from the database
         let store = SyncStore::new();
         
+        // Optimize database on startup - updates query planner statistics
+        store.optimize();
+        
         // Load sync_mode preference
         let sync_mode = match store.load_setting("sync_mode").as_deref() {
             Some("auto") => SyncMode::AutoSync,
@@ -348,12 +371,18 @@ impl RegistryEditorApp {
             // Values - empty until a key is selected
             values: Vec::new(),
             selected_value: None,
+            reset_values_scroll: false,
+            reset_search_scroll: false,
+            scroll_tree_to_selected: false,
+            scroll_tree_frames_remaining: 0,
             
             // Search - default options, new state
             search_options: SearchOptions::default(),
             search_state: SearchState::new(),
             search_results_snapshot: Vec::new(),
             last_executed_query: String::new(),
+            search_debounce_start: None,
+            search_debounce_query: String::new(),
             
             // Backend
             store,
@@ -421,6 +450,9 @@ impl RegistryEditorApp {
     /// Navigate to a path, optionally checking if it exists first.
     /// Use check_exists=false for search results (they came from SQLite, so they exist).
     fn navigate_to_path_internal(&mut self, full_path: &str, check_exists: bool) {
+        // Trim trailing backslash if present (e.g., "HKEY_CURRENT_USER\Software\" -> "HKEY_CURRENT_USER\Software")
+        let full_path = full_path.trim_end_matches('\\');
+        
         // Parse "HKEY_XXX\path\to\key"
         let parts: Vec<&str> = full_path.splitn(2, '\\').collect();
         let root_name = parts[0];
@@ -436,20 +468,56 @@ impl RegistryEditorApp {
                 }
             }
 
-            // Expand all parent keys
+            // Expand all parent keys and pre-fetch their subkeys
             let mut cumulative = root.to_string();
             self.expanded_keys.insert(cumulative.clone());
+            // Pre-fetch root key's subkeys
+            self.store.fetch_subkeys_async(&root, "");
+            
             if !sub_path.is_empty() {
+                let mut parent_path = String::new();
                 for segment in sub_path.split('\\') {
+                    // Pre-fetch this parent's subkeys so tree can render children immediately
+                    if !parent_path.is_empty() {
+                        self.store.fetch_subkeys_async(&root, &parent_path);
+                    }
+                    
                     cumulative = format!("{}\\{}", cumulative, segment);
                     self.expanded_keys.insert(cumulative.clone());
+                    
+                    // Build parent path for next iteration
+                    if parent_path.is_empty() {
+                        parent_path = segment.to_string();
+                    } else {
+                        parent_path = format!("{}\\{}", parent_path, segment);
+                    }
                 }
+                // Also fetch the final selected key's subkeys (in case it has children)
+                self.store.fetch_subkeys_async(&root, &parent_path);
             }
 
             self.selected_root = Some(root.clone());
             self.selected_path = sub_path.to_string();
             self.path_bar = full_path.to_string();
             self.refresh_values();
+            self.reset_values_scroll = true;
+            self.scroll_tree_to_selected = true;
+            self.scroll_tree_frames_remaining = 30;  // Timeout after ~0.5s at 60fps
+            
+            // When navigating from path bar (check_exists=true), switch to Tree panel
+            // so user can see the key's location in the hierarchy.
+            // When navigating from search results (check_exists=false), stay on search
+            // unless the key has no values.
+            if check_exists {
+                // From path bar - always switch to tree
+                self.active_panel = Panel::Tree;
+            } else {
+                // From search - only switch if key has no values
+                let has_cached = self.store.has_cached_values(&root, sub_path);
+                if has_cached && self.values.is_empty() {
+                    self.active_panel = Panel::Tree;
+                }
+            }
         } else {
             // Doesn't start with a valid root — treat as search
             self.run_path_bar_search(full_path);
@@ -710,9 +778,51 @@ impl RegistryEditorApp {
                     .desired_width(ui.available_width() - 80.0)
                     .hint_text("Path or search..."),
             );
+            
+            // Detect typing in path bar - switch to search mode
+            let path_changed = self.path_bar != self.search_debounce_query;
+            if path_changed && !self.path_bar.is_empty() {
+                // Check if this looks like a registry path (contains backslash or starts with HK)
+                let looks_like_path = self.path_bar.contains('\\') 
+                    || self.path_bar.to_uppercase().starts_with("HK");
+                
+                if !looks_like_path {
+                    // Treat as search query - switch to search panel and start debounce
+                    self.active_panel = Panel::Search;
+                    self.search_options.query = self.path_bar.clone();
+                    self.search_debounce_query = self.path_bar.clone();
+                    self.search_debounce_start = Some(Instant::now());
+                    
+                    // Cancel any running search
+                    if self.search_state.is_searching.load(Ordering::Relaxed) {
+                        self.search_state.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let path = self.path_bar.clone();
-                self.navigate_to_path(&path);
+                // Check if it looks like a path or a search
+                let looks_like_path = path.contains('\\') 
+                    || path.to_uppercase().starts_with("HK");
+                
+                if looks_like_path {
+                    self.navigate_to_path(&path);
+                } else if !path.is_empty() {
+                    // Treat as immediate search
+                    self.active_panel = Panel::Search;
+                    self.search_options.query = path.clone();
+                    self.search_debounce_query = path.clone();
+                    self.search_debounce_start = None;
+                    self.last_executed_query = path;
+                    self.search_results_snapshot.clear();
+                    rust_hive::search::start_search_with_store(
+                        self.search_options.clone(),
+                        self.search_state.clone(),
+                        self.store.clone(),
+                        true,
+                    );
+                }
             }
             if ui.button("Go").clicked() {
                 let path = self.path_bar.clone();
@@ -766,6 +876,15 @@ impl RegistryEditorApp {
     }
 
     fn show_tree_panel(&mut self, ui: &mut egui::Ui) {
+        // Handle scroll timeout
+        if self.scroll_tree_to_selected && self.scroll_tree_frames_remaining > 0 {
+            self.scroll_tree_frames_remaining -= 1;
+            if self.scroll_tree_frames_remaining == 0 {
+                // Timeout - give up on scrolling
+                self.scroll_tree_to_selected = false;
+            }
+        }
+        
         egui::ScrollArea::both().show(ui, |ui| {
             let mut nodes_to_render: Vec<(RootKey, String)> = Vec::new();
             for root in RootKey::all() {
@@ -774,6 +893,12 @@ impl RegistryEditorApp {
             let t = Instant::now();
             self.render_tree_nodes(ui, &nodes_to_render);
             self.last_tree_render_us = t.elapsed().as_micros() as u64;
+            
+            // Keep repainting while waiting to scroll to selected node
+            // (node may not be rendered yet because parent subkeys aren't fetched)
+            if self.scroll_tree_to_selected {
+                ui.ctx().request_repaint();
+            }
         });
     }
 
@@ -816,19 +941,24 @@ impl RegistryEditorApp {
 
             if !is_confirmed_leaf {
                 // Node with children (or might have children) - show expand arrow
-                let default_open = self.expanded_keys.contains(&full_key);
+                let should_be_open = self.expanded_keys.contains(&full_key);
                 let id = ui.make_persistent_id(&full_key);
                 
-                let resp = egui::CollapsingHeader::new(
-                    if is_selected {
-                        egui::RichText::new(&display_name).strong()
-                    } else {
-                        egui::RichText::new(&display_name)
-                    },
-                )
+                // Style selected nodes with color and bold
+                let label_text = if is_selected {
+                    egui::RichText::new(format!("📁 {}", display_name))
+                        .strong()
+                        .color(egui::Color32::from_rgb(100, 200, 255))
+                } else {
+                    egui::RichText::new(&display_name)
+                };
+                
+                let header = egui::CollapsingHeader::new(label_text)
                 .id_salt(id)
-                .default_open(default_open)
-                .show(ui, |ui| {
+                .default_open(should_be_open)
+                .open(if should_be_open { Some(true) } else { None });
+                
+                let resp = header.show(ui, |ui| {
                     // Fetch when node is open (needed for root nodes)
                     if !is_fetched {
                         self.store.fetch_subkeys_async(root, path);
@@ -877,6 +1007,12 @@ impl RegistryEditorApp {
                     self.path_bar = full_key.clone();
                     self.refresh_values();
                 }
+                
+                // Scroll to selected item if requested
+                if is_selected && self.scroll_tree_to_selected {
+                    resp.header_response.scroll_to_me(Some(egui::Align::Center));
+                    self.scroll_tree_to_selected = false;
+                }
 
                 // Context menu
                 self.tree_node_context_menu(&resp.header_response, root, path, &full_key);
@@ -884,7 +1020,9 @@ impl RegistryEditorApp {
                 // Confirmed leaf node - no expand arrow, clickable label
                 // Add horizontal spacing to align with CollapsingHeader text (arrow width ~19px)
                 let text = if is_selected {
-                    egui::RichText::new(format!("    {}", display_name)).strong()
+                    egui::RichText::new(format!("    📄 {}", display_name))
+                        .strong()
+                        .color(egui::Color32::from_rgb(100, 200, 255))
                 } else {
                     egui::RichText::new(format!("    {}", display_name))
                 };
@@ -896,6 +1034,12 @@ impl RegistryEditorApp {
                     self.selected_path = path.to_string();
                     self.path_bar = full_key.clone();
                     self.refresh_values();
+                }
+                
+                // Scroll to selected item if requested
+                if is_selected && self.scroll_tree_to_selected {
+                    resp.scroll_to_me(Some(egui::Align::Center));
+                    self.scroll_tree_to_selected = false;
                 }
                 
                 // If this node is selected but values haven't loaded yet, keep trying
@@ -982,42 +1126,29 @@ impl RegistryEditorApp {
     }
 
     fn show_search_panel(&mut self, ui: &mut egui::Ui) {
-        // Search input
+        let is_searching = self.search_state.is_searching.load(Ordering::Relaxed);
+        
+        // Show current search query and cancel button
         ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search_options.query)
-                    .desired_width(ui.available_width() - 120.0)
-                    .hint_text("Search registry..."),
-            );
-
-            let is_searching = self.search_state.is_searching.load(Ordering::Relaxed);
-
-            // Allow canceling search with Escape key
-            if is_searching && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.search_state.cancel.store(true, Ordering::SeqCst);
-            }
-
-            if !is_searching {
-                let search_clicked = ui.button("Search").clicked();
-                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                
-                if (search_clicked || enter_pressed) && !self.search_options.query.is_empty() {
-                    // Run search - SQLite first, then live registry fallback
-                    self.last_executed_query = self.search_options.query.clone();
-                    self.search_results_snapshot.clear();
-                    rust_hive::search::start_search_with_store(
-                        self.search_options.clone(),
-                        self.search_state.clone(),
-                        self.store.clone(),
-                        true, // Enable live fallback for comprehensive search
-                    );
-                }
+            if !self.search_options.query.is_empty() {
+                ui.label(format!("Searching: \"{}\"", self.search_options.query));
             } else {
-                if ui.button("Cancel").clicked() {
-                    self.search_state.cancel.store(true, Ordering::SeqCst);
-                }
+                ui.label("Type in the path bar to search");
             }
+            
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if is_searching {
+                    if ui.button("Cancel").clicked() {
+                        self.search_state.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            });
         });
+        
+        // Allow canceling search with Escape key
+        if is_searching && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search_state.cancel.store(true, Ordering::SeqCst);
+        }
 
         // Search options toggle
         if ui
@@ -1237,6 +1368,7 @@ impl RegistryEditorApp {
             // Search completed - update snapshot with final results (only once when search finishes)
             if self.was_searching_last_frame {
                 self.search_results_snapshot = self.search_state.results.lock().unwrap().clone();
+                self.reset_search_scroll = true;  // Scroll to left when new search completes
             }
             
             if self.search_results_snapshot.is_empty() {
@@ -1248,9 +1380,21 @@ impl RegistryEditorApp {
 
         // Results list - only show when not searching
         let mut navigate_to: Option<String> = None;
+        let mut bookmark_path: Option<String> = None;
         
         if !is_searching {
-            egui::ScrollArea::both().show(ui, |ui| {
+            let scroll_to_left = self.reset_search_scroll;
+            self.reset_search_scroll = false;
+            
+            let mut scroll_area = egui::ScrollArea::both()
+                .id_salt("search_results_scroll");
+            
+            // Reset horizontal scroll only (not vertical) when clicking a result
+            if scroll_to_left {
+                scroll_area = scroll_area.horizontal_scroll_offset(0.0);
+            }
+            
+            scroll_area.show(ui, |ui| {
                 for (idx, result) in self.search_results_snapshot.iter().enumerate() {
                     let icon = match result.match_type {
                         MatchType::KeyName => "🔑",
@@ -1270,6 +1414,9 @@ impl RegistryEditorApp {
                         MatchType::ValueName => egui::Color32::from_rgb(100, 255, 100),
                         MatchType::ValueData => egui::Color32::from_rgb(255, 200, 100),
                     };
+
+                    let full_path = result.full_path();
+                    let is_bookmarked = self.store.is_bookmarked(&full_path);
 
                     egui::Frame::new()
                         .fill(bg_color)
@@ -1304,6 +1451,32 @@ impl RegistryEditorApp {
                                     navigate_to = Some(result.full_path());
                                 }
 
+                                // Context menu on right-click
+                                resp.context_menu(|ui| {
+                                    if is_bookmarked {
+                                        if ui.button("Remove Bookmark").clicked() {
+                                            self.store.remove_bookmark(&full_path);
+                                            self.status_message = "Bookmark removed".to_string();
+                                            ui.close_menu();
+                                        }
+                                    } else {
+                                        if ui.button("Add Bookmark").clicked() {
+                                            bookmark_path = Some(full_path.clone());
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    
+                                    ui.separator();
+                                    
+                                    if ui.button("Copy Path").clicked() {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            clipboard.set_text(&full_path).ok();
+                                        }
+                                        self.status_message = "Path copied to clipboard".to_string();
+                                        ui.close_menu();
+                                    }
+                                });
+
                                 resp.on_hover_text(format!(
                                     "Match: {}\nPath: {}",
                                     result.match_type,
@@ -1315,11 +1488,25 @@ impl RegistryEditorApp {
             });
         }
         
+        // Handle bookmark addition outside the closure
+        if let Some(path) = bookmark_path {
+            let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+            self.store.add_bookmark(&Bookmark {
+                name,
+                path,
+                notes: String::new(),
+                color: None,
+            });
+            self.status_message = "Bookmark added".to_string();
+        }
+        
         // Handle navigation outside the scroll area closure
         if let Some(path) = navigate_to {
             // Ensure parent keys are cached so the tree can display them
             self.ensure_path_cached(&path);
             self.navigate_to_path_internal(&path, false);
+            // Scroll search results to the left (key names can be very long)
+            self.reset_search_scroll = true;
             // Stay on search panel - don't switch to tree
         }
     }
@@ -1603,8 +1790,18 @@ impl RegistryEditorApp {
 
         ui.separator();
 
-        // Values list
-        egui::ScrollArea::both().show(ui, |ui| {
+        // Values list - use id_salt so we can reset scroll position
+        let scroll_to_top = self.reset_values_scroll;
+        self.reset_values_scroll = false;
+        
+        egui::ScrollArea::both()
+            .id_salt("values_scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                // Reset scroll to top-left if requested
+                if scroll_to_top {
+                    ui.scroll_to_cursor(Some(egui::Align::Min));
+                }
             let values_clone = self.values.clone();
             let mut edit_value: Option<usize> = None;
             let mut delete_value: Option<usize> = None;
@@ -2946,6 +3143,36 @@ impl eframe::App for RegistryEditorApp {
             self.last_frame_ms = prev.elapsed().as_secs_f32() * 1000.0;
         }
         self.last_frame_start = Some(frame_start);
+
+        // ─────────────────────────────────────────────────────────────────
+        // Search debounce check - runs every frame to ensure timer fires
+        // ─────────────────────────────────────────────────────────────────
+        const SEARCH_DEBOUNCE_MS: u64 = 500;
+        if let Some(start) = self.search_debounce_start {
+            let elapsed = start.elapsed().as_millis() as u64;
+            let is_searching = self.search_state.is_searching.load(Ordering::Relaxed);
+            
+            if elapsed >= SEARCH_DEBOUNCE_MS 
+                && !is_searching 
+                && !self.search_options.query.is_empty()
+                && self.search_options.query != self.last_executed_query
+            {
+                // Clear debounce timer and start search
+                self.search_debounce_start = None;
+                self.last_executed_query = self.search_options.query.clone();
+                self.search_results_snapshot.clear();
+                rust_hive::search::start_search_with_store(
+                    self.search_options.clone(),
+                    self.search_state.clone(),
+                    self.store.clone(),
+                    true,
+                );
+            } else if elapsed < SEARCH_DEBOUNCE_MS {
+                // Schedule one repaint when debounce expires (not every frame)
+                let remaining = std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS - elapsed);
+                ctx.request_repaint_after(remaining);
+            }
+        }
 
         // Handle keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
