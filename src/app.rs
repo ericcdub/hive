@@ -228,6 +228,9 @@ pub struct RegistryEditorApp {
     /// Flag to reset values scroll area to top-left on next frame
     reset_values_scroll: bool,
     
+    /// Value name to scroll to and select (set when clicking value search results)
+    scroll_to_value_name: Option<String>,
+    
     /// Flag to reset search results scroll area to top-left on next frame
     reset_search_scroll: bool,
     
@@ -372,6 +375,7 @@ impl RegistryEditorApp {
             values: Vec::new(),
             selected_value: None,
             reset_values_scroll: false,
+            scroll_to_value_name: None,
             reset_search_scroll: false,
             scroll_tree_to_selected: false,
             scroll_tree_frames_remaining: 0,
@@ -470,7 +474,7 @@ impl RegistryEditorApp {
 
             // Expand all parent keys and pre-fetch their subkeys
             let mut cumulative = root.to_string();
-            self.expanded_keys.insert(cumulative.clone());
+            self.expanded_keys.insert(cumulative.to_lowercase());
             // Pre-fetch root key's subkeys
             self.store.fetch_subkeys_async(&root, "");
             
@@ -483,7 +487,7 @@ impl RegistryEditorApp {
                     }
                     
                     cumulative = format!("{}\\{}", cumulative, segment);
-                    self.expanded_keys.insert(cumulative.clone());
+                    self.expanded_keys.insert(cumulative.to_lowercase());
                     
                     // Build parent path for next iteration
                     if parent_path.is_empty() {
@@ -502,7 +506,7 @@ impl RegistryEditorApp {
             self.refresh_values();
             self.reset_values_scroll = true;
             self.scroll_tree_to_selected = true;
-            self.scroll_tree_frames_remaining = 30;  // Timeout after ~0.5s at 60fps
+            self.scroll_tree_frames_remaining = 120;  // ~2 seconds at 60fps - need time for async fetches
             
             // When navigating from path bar (check_exists=true), switch to Tree panel
             // so user can see the key's location in the hierarchy.
@@ -557,6 +561,50 @@ impl RegistryEditorApp {
     fn maybe_auto_sync(&mut self) {
         if self.sync_mode == SyncMode::AutoSync {
             self.store.push_to_registry_async();
+        }
+    }
+
+    /// Expand all parent nodes of the currently selected key and trigger scroll.
+    /// Call this when switching to the tree panel to ensure the selected node is visible.
+    fn expand_to_selected(&mut self) {
+        if let Some(ref root) = self.selected_root {
+            // Build full path and expand all parents
+            let mut cumulative = root.to_string();
+            self.expanded_keys.insert(cumulative.to_lowercase());
+            
+            // Pre-fetch ALL parent paths upfront so they're all in-flight at once
+            // This ensures the tree can render all the way down as soon as fetches complete
+            self.store.fetch_subkeys_async(root, "");  // Root's children
+            
+            if !self.selected_path.is_empty() {
+                let segments: Vec<&str> = self.selected_path.split('\\').collect();
+                let mut parent_path = String::new();
+                
+                // Pre-fetch subkeys for every parent in the path
+                for (i, segment) in segments.iter().enumerate() {
+                    // Fetch this parent's subkeys (so the tree can show its children)
+                    if !parent_path.is_empty() {
+                        self.store.fetch_subkeys_async(root, &parent_path);
+                    }
+                    
+                    // Build cumulative path for expanded_keys
+                    cumulative = format!("{}\\{}", cumulative, segment);
+                    self.expanded_keys.insert(cumulative.to_lowercase());
+                    
+                    // Build parent_path for next iteration's fetch
+                    if parent_path.is_empty() {
+                        parent_path = segment.to_string();
+                    } else {
+                        parent_path = format!("{}\\{}", parent_path, segment);
+                    }
+                    
+                    // Also fetch this path's subkeys (in case user wants to expand further)
+                    self.store.fetch_subkeys_async(root, &parent_path);
+                }
+            }
+            
+            self.scroll_tree_to_selected = true;
+            self.scroll_tree_frames_remaining = 120;  // ~2 seconds at 60fps - need time for async fetches
         }
     }
 
@@ -839,6 +887,8 @@ impl RegistryEditorApp {
                 .clicked()
             {
                 self.active_panel = Panel::Tree;
+                // Expand parents and scroll to selected node when switching to Registry panel
+                self.expand_to_selected();
             }
             if ui
                 .selectable_label(self.active_panel == Panel::Search, "Search")
@@ -876,9 +926,15 @@ impl RegistryEditorApp {
     }
 
     fn show_tree_panel(&mut self, ui: &mut egui::Ui) {
-        // Handle scroll timeout
+        // Handle scroll timeout - but don't timeout while fetches are pending
+        // (deep paths need time for all parent subkeys to be fetched)
+        let has_pending_fetches = self.store.pending_fetches.load(Ordering::Relaxed) > 0;
+        
         if self.scroll_tree_to_selected && self.scroll_tree_frames_remaining > 0 {
-            self.scroll_tree_frames_remaining -= 1;
+            // Only decrement if no pending fetches - give async fetches time to complete
+            if !has_pending_fetches {
+                self.scroll_tree_frames_remaining -= 1;
+            }
             if self.scroll_tree_frames_remaining == 0 {
                 // Timeout - give up on scrolling
                 self.scroll_tree_to_selected = false;
@@ -916,8 +972,9 @@ impl RegistryEditorApp {
                 path.rsplit('\\').next().unwrap_or(path).to_string()
             };
 
+            // Case-insensitive comparison for selection (Windows registry is case-insensitive)
             let is_selected = self.selected_root.as_ref() == Some(root)
-                && self.selected_path == *path;
+                && self.selected_path.eq_ignore_ascii_case(path);
 
             // Single mutex acquire: returns (subkeys, is_fetched).
             // Root keys (path="") are NOT treated as pre-fetched — they must be fetched
@@ -941,7 +998,8 @@ impl RegistryEditorApp {
 
             if !is_confirmed_leaf {
                 // Node with children (or might have children) - show expand arrow
-                let should_be_open = self.expanded_keys.contains(&full_key);
+                // Use lowercase for consistent case-insensitive comparison
+                let should_be_open = self.expanded_keys.contains(&full_key.to_lowercase());
                 let id = ui.make_persistent_id(&full_key);
                 
                 // Style selected nodes with color and bold
@@ -956,7 +1014,14 @@ impl RegistryEditorApp {
                 let header = egui::CollapsingHeader::new(label_text)
                 .id_salt(id)
                 .default_open(should_be_open)
-                .open(if should_be_open { Some(true) } else { None });
+                // Only force open during programmatic navigation, otherwise let user control
+                .open(if self.scroll_tree_to_selected && should_be_open { Some(true) } else { None });
+                
+                // If we're forcing this node open for navigation, ensure it stays in expanded_keys
+                // This prevents the node from closing when we stop forcing after timeout
+                if self.scroll_tree_to_selected && should_be_open {
+                    self.expanded_keys.insert(full_key.to_lowercase());
+                }
                 
                 let resp = header.show(ui, |ui| {
                     // Fetch when node is open (needed for root nodes)
@@ -965,11 +1030,43 @@ impl RegistryEditorApp {
                     }
                     
                     // Cap visible children to avoid egui laying out thousands of widgets
+                    // But always include the path to the selected node so we can scroll to it
                     const MAX_CHILDREN: usize = 500;
                     let total = subkeys.len();
-                    let visible = subkeys.iter().take(MAX_CHILDREN);
-
-                    let child_nodes: Vec<(RootKey, String)> = visible
+                    
+                    // Find if we need to include a specific child for navigation
+                    let target_child = if self.scroll_tree_to_selected {
+                        // Check if any of our children is on the path to the selected node
+                        if let Some(ref sel_root) = self.selected_root {
+                            if sel_root == root && self.selected_path.to_lowercase().starts_with(&path.to_lowercase()) {
+                                // Get the next segment after our path
+                                let remaining = if path.is_empty() {
+                                    &self.selected_path
+                                } else if self.selected_path.len() > path.len() + 1 {
+                                    &self.selected_path[path.len() + 1..]
+                                } else {
+                                    ""
+                                };
+                                let next_segment = remaining.split('\\').next().unwrap_or("");
+                                if !next_segment.is_empty() {
+                                    // Find this child in subkeys (case-insensitive)
+                                    subkeys.iter().find(|s| s.eq_ignore_ascii_case(next_segment)).cloned()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    // Build child nodes list - first MAX_CHILDREN plus the target if not already included
+                    let mut child_nodes: Vec<(RootKey, String)> = subkeys.iter()
+                        .take(MAX_CHILDREN)
                         .map(|subkey| {
                             let child_path = if path.is_empty() {
                                 subkey.clone()
@@ -979,6 +1076,23 @@ impl RegistryEditorApp {
                             (root.clone(), child_path)
                         })
                         .collect();
+                    
+                    // If target child exists and isn't in the first MAX_CHILDREN, add it
+                    if let Some(ref target) = target_child {
+                        let target_in_list = child_nodes.iter().any(|(_, p)| {
+                            let child_name = p.rsplit('\\').next().unwrap_or(p);
+                            child_name.eq_ignore_ascii_case(target)
+                        });
+                        if !target_in_list {
+                            let child_path = if path.is_empty() {
+                                target.clone()
+                            } else {
+                                format!("{}\\{}", path, target)
+                            };
+                            child_nodes.push((root.clone(), child_path));
+                        }
+                    }
+                    
                     self.render_tree_nodes(ui, &child_nodes);
 
                     if total > MAX_CHILDREN {
@@ -994,10 +1108,13 @@ impl RegistryEditorApp {
                 });
 
                 // Track expansion state based on fully open/closed, not animation
-                if resp.fully_open() {
-                    self.expanded_keys.insert(full_key.clone());
-                } else if resp.fully_closed() {
-                    self.expanded_keys.remove(&full_key);
+                // But only if we're not in programmatic navigation mode
+                if !self.scroll_tree_to_selected {
+                    if resp.fully_open() {
+                        self.expanded_keys.insert(full_key.to_lowercase());
+                    } else if resp.fully_closed() {
+                        self.expanded_keys.remove(&full_key.to_lowercase());
+                    }
                 }
 
                 // Handle click on header
@@ -1008,10 +1125,14 @@ impl RegistryEditorApp {
                     self.refresh_values();
                 }
                 
-                // Scroll to selected item if requested
-                if is_selected && self.scroll_tree_to_selected {
+                // Scroll to selected item if requested (keep trying for multiple frames)
+                if is_selected && self.scroll_tree_to_selected && self.scroll_tree_frames_remaining > 0 {
                     resp.header_response.scroll_to_me(Some(egui::Align::Center));
-                    self.scroll_tree_to_selected = false;
+                    // Don't clear immediately - keep scrolling for a few more frames
+                    // to ensure the scroll takes effect
+                    if self.scroll_tree_frames_remaining > 110 {
+                        self.scroll_tree_frames_remaining = 10;  // Found it, just need a few more frames
+                    }
                 }
 
                 // Context menu
@@ -1036,10 +1157,13 @@ impl RegistryEditorApp {
                     self.refresh_values();
                 }
                 
-                // Scroll to selected item if requested
-                if is_selected && self.scroll_tree_to_selected {
+                // Scroll to selected item if requested (keep trying for multiple frames)
+                if is_selected && self.scroll_tree_to_selected && self.scroll_tree_frames_remaining > 0 {
                     resp.scroll_to_me(Some(egui::Align::Center));
-                    self.scroll_tree_to_selected = false;
+                    // Don't clear immediately - keep scrolling for a few more frames
+                    if self.scroll_tree_frames_remaining > 110 {
+                        self.scroll_tree_frames_remaining = 10;  // Found it, just need a few more frames
+                    }
                 }
                 
                 // If this node is selected but values haven't loaded yet, keep trying
@@ -1379,7 +1503,7 @@ impl RegistryEditorApp {
         }
 
         // Results list - only show when not searching
-        let mut navigate_to: Option<String> = None;
+        let mut navigate_to: Option<(String, Option<String>)> = None;  // (path, value_name)
         let mut bookmark_path: Option<String> = None;
         
         if !is_searching {
@@ -1448,7 +1572,7 @@ impl RegistryEditorApp {
                                 );
 
                                 if resp.clicked() {
-                                    navigate_to = Some(result.full_path());
+                                    navigate_to = Some((result.full_path(), result.value_name.clone()));
                                 }
 
                                 // Context menu on right-click
@@ -1501,10 +1625,12 @@ impl RegistryEditorApp {
         }
         
         // Handle navigation outside the scroll area closure
-        if let Some(path) = navigate_to {
+        if let Some((path, value_name)) = navigate_to {
             // Ensure parent keys are cached so the tree can display them
             self.ensure_path_cached(&path);
             self.navigate_to_path_internal(&path, false);
+            // If clicking a value result, scroll to that value
+            self.scroll_to_value_name = value_name;
             // Scroll search results to the left (key names can be very long)
             self.reset_search_scroll = true;
             // Stay on search panel - don't switch to tree
@@ -1794,12 +1920,17 @@ impl RegistryEditorApp {
         let scroll_to_top = self.reset_values_scroll;
         self.reset_values_scroll = false;
         
+        // Check if we need to scroll to a specific value (from search result click)
+        // Don't take() yet - only consume when we actually find the value
+        let scroll_to_value = self.scroll_to_value_name.clone();
+        let mut found_scroll_target = false;
+        
         egui::ScrollArea::both()
             .id_salt("values_scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
-                // Reset scroll to top-left if requested
-                if scroll_to_top {
+                // Reset scroll to top-left if requested (but not if we're trying to scroll to a value)
+                if scroll_to_top && scroll_to_value.is_none() {
                     ui.scroll_to_cursor(Some(egui::Align::Min));
                 }
             let values_clone = self.values.clone();
@@ -1818,8 +1949,20 @@ impl RegistryEditorApp {
                             val.name.clone()
                         };
 
-                        let is_selected = self.selected_value == Some(i);
+                        // Check if this is the value we should scroll to
+                        let should_scroll_here = scroll_to_value.as_ref().map_or(false, |target| {
+                            target == &display_name
+                        });
+
+                        let is_selected = self.selected_value == Some(i) || should_scroll_here;
                         let name_resp = ui.selectable_label(is_selected, &display_name);
+                        
+                        // Auto-select and scroll to this value if it's the search target
+                        if should_scroll_here {
+                            self.selected_value = Some(i);
+                            name_resp.scroll_to_me(Some(egui::Align::Center));
+                            found_scroll_target = true;
+                        }
 
                         if name_resp.clicked() {
                             self.selected_value = Some(i);
@@ -1923,6 +2066,14 @@ impl RegistryEditorApp {
                 }
             }
         });
+        
+        // Clear scroll target if we found it, otherwise keep trying (values may still be loading)
+        if found_scroll_target {
+            self.scroll_to_value_name = None;
+        } else if self.scroll_to_value_name.is_some() {
+            // Values not loaded yet - keep repainting until we find it
+            ui.ctx().request_repaint();
+        }
     }
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
